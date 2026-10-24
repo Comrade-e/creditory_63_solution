@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import jwt
-from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
@@ -15,6 +15,8 @@ from pwdlib import PasswordHash
 from psycopg.errors import UniqueViolation
 
 from backend.src.db import get_connection
+
+from psycopg.types.json import Jsonb
 
 
 password_hash = PasswordHash.recommended()
@@ -146,6 +148,15 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+class CreateApplicationRequest(BaseModel):
+    companyData: dict = Field(default_factory=dict)
+    financialData: dict = Field(default_factory=dict)
+
+class UpdateApplicationRequest(BaseModel):
+    companyData: dict | None = None
+    financialData: dict | None = None
 
 
 def hash_refresh_token(token: str) -> str:
@@ -410,8 +421,8 @@ def refresh(
     }
 
 
-@app.get("/api/v1/auth/me")
-def get_me(authorization: str | None = Header(default=None)):
+def get_current_user(authorization: str | None = Header(default=None)) -> dict:
+    """Validate the access JWT and ensure its session has not been revoked."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
@@ -441,8 +452,8 @@ def get_me(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid access token")
 
     try:
-        session_uuid = UUID(session_id)
         user_uuid = UUID(user_id)
+        session_uuid = UUID(session_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid access token")
 
@@ -468,6 +479,11 @@ def get_me(authorization: str | None = Header(default=None)):
         "email": user[1],
         "role": user[2],
     }
+
+
+@app.get("/api/v1/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    return current_user
 
 
 @app.post("/api/v1/auth/logout", status_code=204)
@@ -546,9 +562,8 @@ def lookup_company(inn: str = Query(min_length=10, max_length=12)):
 
 
 @app.get("/api/v1/applications")
-def get_applications():
-    # Temporary placeholder. Replace with user_id from the validated access token.
-    user_id = "test-user"
+def get_applications(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
 
     try:
         with get_connection() as conn, conn.cursor() as cur:
@@ -574,6 +589,8 @@ def get_applications():
             for row in rows
         ]
 
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -582,9 +599,11 @@ def get_applications():
 
 
 @app.get("/api/v1/applications/{id}")
-def get_application(id: UUID):
-    # Temporary placeholder. Replace with user_id from the validated access token.
-    user_id = "test-user"
+def get_application(
+    id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["id"]
 
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -607,3 +626,117 @@ def get_application(id: UUID):
         "financialData": row[3],
         "createdAt": row[4].isoformat(),
     }
+
+@app.post("/api/v1/applications", status_code=201)
+def create_application(
+    data: CreateApplicationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["id"]
+
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO applications (
+                    user_id,
+                    status,
+                    company_data,
+                    financial_data,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, NOW())
+                RETURNING
+                    id,
+                    status,
+                    company_data,
+                    financial_data,
+                    created_at
+                """,
+                (
+                    user_id,
+                    "draft",
+                    Jsonb(data.companyData),
+                    Jsonb(data.financialData),
+                ),
+            )
+
+            row = cur.fetchone()
+
+        return {
+            "id": str(row[0]),
+            "status": row[1],
+            "companyData": row[2],
+            "financialData": row[3],
+            "createdAt": row[4].isoformat(),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Не удалось создать заявку",
+        ) from exc
+
+@app.patch("/api/v1/applications/{id}")
+def update_application(
+    id: UUID,
+    data: UpdateApplicationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    # Получаем только поля, которые действительно прислал клиент
+    changes = data.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=400,
+            detail="Не переданы данные для обновления",
+        )
+
+    # Разрешаем обновлять только эти поля
+    allowed_fields = {
+        "companyData": ("company_data", Jsonb),
+        "financialData": ("financial_data", Jsonb),
+    }
+
+    set_parts = []
+    values = []
+
+    for field, value in changes.items():
+        column, wrapper = allowed_fields[field]
+
+        set_parts.append(f"{column} = %s")
+        values.append(wrapper(value) if value is not None else None)
+
+    values.extend([id, current_user["id"]])
+
+    query = f"""
+        UPDATE applications
+        SET {", ".join(set_parts)}
+        WHERE id = %s
+          AND user_id = %s
+          AND status = 'draft'
+        RETURNING id, status, company_data, financial_data, created_at
+    """
+
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(query, values)
+        row = cur.fetchone()
+
+    if row is None:
+        # Заявка не найдена, принадлежит другому пользователю
+        # либо уже не является черновиком
+        raise HTTPException(
+            status_code=404,
+            detail="Черновик не найден или недоступен для редактирования",
+        )
+
+    return {
+        "id": str(row[0]),
+        "status": row[1],
+        "companyData": row[2],
+        "financialData": row[3],
+        "createdAt": row[4].isoformat() if row[4] else None,
+    }
+
+@app.post("/api/v1/applications/{id}/documents"):
+def load_document()

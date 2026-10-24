@@ -21,6 +21,20 @@ def init_db():
     role VARCHAR(50) NOT NULL DEFAULT 'user',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );""")
+
+            cur.execute("""CREATE TABLE IF NOT EXISTS loan_products (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name VARCHAR(255) NOT NULL UNIQUE,
+                purpose VARCHAR(255) NOT NULL,
+                description TEXT,
+                min_amount FLOAT,
+                max_amount FLOAT,
+                min_term_months INTEGER,
+                max_term_months INTEGER,
+                annual_rate FLOAT,
+                is_active BOOLEAN
+            );""")
+
             cur.execute("""CREATE TABLE IF NOT EXISTS applications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id),
@@ -33,20 +47,9 @@ def init_db():
     rejection_cause TEXT,
     submitted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTANPTZ
+    updated_at TIMESTAMPTZ
 );""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS loan_products (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL UNIQUE,
-    purpose VARCHAR(255) NOT NULL,
-    description TEXT,
-    min_amount FLOAT,
-    max_amount FLOAT,
-    min_term_months INTEGER,
-    max_term_months INTEGER,
-    annual_rate FLOAT,
-    is_active BOOLEAN
-);""")
+
             cur.execute("""CREATE TABLE IF NOT EXISTS documents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     application_id UUID NOT NULL REFERENCES applications(id),
