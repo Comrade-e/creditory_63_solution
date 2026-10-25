@@ -6,3 +6,4 @@ alembic
 psycopg[binary]
 pwdlib
 PyJwt
+smolagents

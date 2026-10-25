@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import jwt
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response, Form, UploadFile, File
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
@@ -16,8 +16,9 @@ from psycopg.errors import UniqueViolation
 
 from backend.src.db import get_connection
 
-from psycopg.types.json import Jsonb
+from psycopg.types.json import Json, Jsonb
 
+from agent import generate_recommendations, RecommendationApplicationNotFound, RecommendationGenerationError
 
 password_hash = PasswordHash.recommended()
 
@@ -33,6 +34,15 @@ REFRESH_COOKIE_PATH = "/api/v1/auth"
 # In production, use HTTPS and set REFRESH_COOKIE_SECURE=true.
 REFRESH_COOKIE_SECURE = os.getenv("REFRESH_COOKIE_SECURE", "false").lower() == "true"
 REFRESH_COOKIE_SAMESITE = os.getenv("REFRESH_COOKIE_SAMESITE", "lax").lower()
+
+from pathlib import Path
+from uuid import uuid4
+
+# Максимальный размер загружаемого файла — 10 МБ
+MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
+
+# Директория для хранения загруженных документов
+DOCUMENTS_DIR = Path("uploads/documents")
 
 app = FastAPI()
 
@@ -151,12 +161,16 @@ class LoginRequest(BaseModel):
 
 
 class CreateApplicationRequest(BaseModel):
-    companyData: dict = Field(default_factory=dict)
-    financialData: dict = Field(default_factory=dict)
+    companyData: dict
+    selectedProductId: UUID
+    originalTerms: dict
+    activeTerms: dict
+
 
 class UpdateApplicationRequest(BaseModel):
     companyData: dict | None = None
-    financialData: dict | None = None
+    selectedProductId: UUID | None = None
+    activeTerms: dict | None = None
 
 
 def hash_refresh_token(token: str) -> str:
@@ -565,37 +579,33 @@ def lookup_company(inn: str = Query(min_length=10, max_length=12)):
 def get_applications(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
 
-    try:
-        with get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, status, company_data, financial_data, created_at
-                FROM applications
-                WHERE user_id = %s
-                ORDER BY created_at DESC
-                """,
-                (user_id,),
-            )
-            rows = cur.fetchall()
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, status, company_data, selected_product_id,
+                   original_terms, active_terms, submitted_at, created_at, updated_at
+            FROM applications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
 
-        return [
-            {
-                "id": str(row[0]),
-                "status": row[1],
-                "companyData": row[2],
-                "financialData": row[3],
-                "createdAt": row[4].isoformat(),
-            }
-            for row in rows
-        ]
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Не удалось получить заявки",
-        ) from exc
+    return [
+        {
+            "id": str(row[0]),
+            "status": row[1],
+            "companyData": row[2],
+            "selectedProductId": str(row[3]),
+            "originalTerms": row[4],
+            "activeTerms": row[5],
+            "submittedAt": row[6].isoformat() if row[6] else None,
+            "createdAt": row[7].isoformat() if row[7] else None,
+            "updatedAt": row[8].isoformat() if row[8] else None,
+        }
+        for row in rows
+    ]
 
 
 @app.get("/api/v1/applications/{id}")
@@ -603,16 +613,15 @@ def get_application(
     id: UUID,
     current_user: dict = Depends(get_current_user),
 ):
-    user_id = current_user["id"]
-
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, status, company_data, financial_data, created_at
+            SELECT id, status, company_data, selected_product_id,
+                   original_terms, active_terms, submitted_at, created_at, updated_at
             FROM applications
             WHERE id = %s AND user_id = %s
             """,
-            (id, user_id),
+            (id, current_user["id"]),
         )
         row = cur.fetchone()
 
@@ -623,59 +632,61 @@ def get_application(
         "id": str(row[0]),
         "status": row[1],
         "companyData": row[2],
-        "financialData": row[3],
-        "createdAt": row[4].isoformat(),
+        "selectedProductId": str(row[3]),
+        "originalTerms": row[4],
+        "activeTerms": row[5],
+        "submittedAt": row[6].isoformat() if row[6] else None,
+        "createdAt": row[7].isoformat() if row[7] else None,
+        "updatedAt": row[8].isoformat() if row[8] else None,
     }
+
 
 @app.post("/api/v1/applications", status_code=201)
 def create_application(
     data: CreateApplicationRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    user_id = current_user["id"]
+    with get_connection() as conn, conn.cursor() as cur:
+        # Ensure the selected product exists and is active before creating the draft.
+        cur.execute(
+            "SELECT id FROM loan_products WHERE id = %s AND is_active IS TRUE",
+            (data.selectedProductId,),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Кредитный продукт не найден или неактивен")
 
-    try:
-        with get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO applications (
-                    user_id,
-                    status,
-                    company_data,
-                    financial_data,
-                    created_at
-                )
-                VALUES (%s, %s, %s, %s, NOW())
-                RETURNING
-                    id,
-                    status,
-                    company_data,
-                    financial_data,
-                    created_at
-                """,
-                (
-                    user_id,
-                    "draft",
-                    Jsonb(data.companyData),
-                    Jsonb(data.financialData),
-                ),
+        cur.execute(
+            """
+            INSERT INTO applications (
+                user_id, company_data, selected_product_id,
+                original_terms, active_terms, status
             )
+            VALUES (%s, %s, %s, %s, %s, 'draft')
+            RETURNING id, status, company_data, selected_product_id,
+                      original_terms, active_terms, submitted_at, created_at, updated_at
+            """,
+            (
+                current_user["id"],
+                Jsonb(data.companyData),
+                data.selectedProductId,
+                Jsonb(data.originalTerms),
+                Json(data.activeTerms),
+            ),
+        )
+        row = cur.fetchone()
 
-            row = cur.fetchone()
+    return {
+        "id": str(row[0]),
+        "status": row[1],
+        "companyData": row[2],
+        "selectedProductId": str(row[3]),
+        "originalTerms": row[4],
+        "activeTerms": row[5],
+        "submittedAt": row[6].isoformat() if row[6] else None,
+        "createdAt": row[7].isoformat() if row[7] else None,
+        "updatedAt": row[8].isoformat() if row[8] else None,
+    }
 
-        return {
-            "id": str(row[0]),
-            "status": row[1],
-            "companyData": row[2],
-            "financialData": row[3],
-            "createdAt": row[4].isoformat(),
-        }
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Не удалось создать заявку",
-        ) from exc
 
 @app.patch("/api/v1/applications/{id}")
 def update_application(
@@ -683,30 +694,32 @@ def update_application(
     data: UpdateApplicationRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    # Получаем только поля, которые действительно прислал клиент
     changes = data.model_dump(exclude_unset=True)
-
     if not changes:
-        raise HTTPException(
-            status_code=400,
-            detail="Не переданы данные для обновления",
-        )
+        raise HTTPException(status_code=400, detail="Не переданы данные для обновления")
 
-    # Разрешаем обновлять только эти поля
     allowed_fields = {
         "companyData": ("company_data", Jsonb),
-        "financialData": ("financial_data", Jsonb),
+        "selectedProductId": ("selected_product_id", None),
+        "activeTerms": ("active_terms", Json),
     }
 
     set_parts = []
     values = []
-
     for field, value in changes.items():
         column, wrapper = allowed_fields[field]
-
+        if field == "selectedProductId" and value is not None:
+            with get_connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM loan_products WHERE id = %s AND is_active IS TRUE",
+                    (value,),
+                )
+                if cur.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Кредитный продукт не найден или неактивен")
         set_parts.append(f"{column} = %s")
-        values.append(wrapper(value) if value is not None else None)
+        values.append(wrapper(value) if value is not None and wrapper else value)
 
+    set_parts.append("updated_at = NOW()")
     values.extend([id, current_user["id"]])
 
     query = f"""
@@ -715,7 +728,8 @@ def update_application(
         WHERE id = %s
           AND user_id = %s
           AND status = 'draft'
-        RETURNING id, status, company_data, financial_data, created_at
+        RETURNING id, status, company_data, selected_product_id,
+                  original_terms, active_terms, submitted_at, created_at, updated_at
     """
 
     with get_connection() as conn, conn.cursor() as cur:
@@ -723,8 +737,6 @@ def update_application(
         row = cur.fetchone()
 
     if row is None:
-        # Заявка не найдена, принадлежит другому пользователю
-        # либо уже не является черновиком
         raise HTTPException(
             status_code=404,
             detail="Черновик не найден или недоступен для редактирования",
@@ -734,9 +746,202 @@ def update_application(
         "id": str(row[0]),
         "status": row[1],
         "companyData": row[2],
-        "financialData": row[3],
-        "createdAt": row[4].isoformat() if row[4] else None,
+        "selectedProductId": str(row[3]),
+        "originalTerms": row[4],
+        "activeTerms": row[5],
+        "submittedAt": row[6].isoformat() if row[6] else None,
+        "createdAt": row[7].isoformat() if row[7] else None,
+        "updatedAt": row[8].isoformat() if row[8] else None,
     }
 
-@app.post("/api/v1/applications/{id}/documents"):
-def load_document()
+@app.post("/api/v1/applications/{id}/documents", status_code=201)
+async def upload_document(
+    id: UUID,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload a document for the current user's draft application."""
+    document_type = document_type.strip()
+    if not document_type:
+        raise HTTPException(status_code=400, detail="Укажите тип документа")
+
+    # Verify ownership and draft status before writing anything to disk.
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id
+            FROM applications
+            WHERE id = %s AND user_id = %s AND status = 'draft'
+            """,
+            (id, current_user["id"]),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Черновик не найден или недоступен для загрузки документов",
+            )
+
+    original_name = Path(file.filename or "document").name
+    if not original_name or original_name in {".", ".."}:
+        original_name = "document"
+    suffix = Path(original_name).suffix[:20]
+    mime_type = file.content_type or "application/octet-stream"
+
+    # Read at most one byte over the limit to detect oversized files.
+    content = await file.read(MAX_DOCUMENT_SIZE + 1)
+    await file.close()
+    if len(content) > MAX_DOCUMENT_SIZE:
+        raise HTTPException(status_code=413, detail="Файл превышает допустимый размер 10 МБ")
+    if not content:
+        raise HTTPException(status_code=400, detail="Нельзя загрузить пустой файл")
+
+    document_id = uuid4()
+    try:
+        DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        file_path = DOCUMENTS_DIR / f"{document_id}{suffix}"
+        file_path.write_bytes(content)
+
+        try:
+            with get_connection() as conn, conn.cursor() as cur:
+                # Recheck application state inside the insert transaction to avoid
+                # accepting a document if the draft was changed meanwhile.
+                cur.execute(
+                    """
+                    INSERT INTO documents (
+                        id, application_id, document_type, original_name,
+                        storage_path, mime_type
+                    )
+                    SELECT %s, a.id, %s, %s, %s, %s
+                    FROM applications AS a
+                    WHERE a.id = %s AND a.user_id = %s AND a.status = 'draft'
+                    RETURNING id, application_id, document_type, original_name,
+                              storage_path, mime_type, uploaded_at
+                    """,
+                    (
+                        document_id, document_type, original_name,
+                        str(file_path), mime_type, id, current_user["id"],
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Черновик не найден или недоступен для загрузки документов",
+                    )
+        except Exception:
+            file_path.unlink(missing_ok=True)
+            raise
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Не удалось сохранить файл") from exc
+
+    return {
+        "id": str(row[0]),
+        "applicationId": str(row[1]),
+        "documentType": row[2],
+        "originalName": row[3],
+        "storagePath": row[4],
+        "mimeType": row[5],
+        "uploadedAt": row[6].isoformat() if row[6] else None,
+    }
+
+from uuid import UUID
+
+from fastapi import Depends, HTTPException
+from pydantic import BaseModel
+
+
+class SubmitApplicationRequest(BaseModel):
+    selectedProductId: UUID
+
+
+@app.post("/api/v1/applications/{id}/submit")
+def submit_application(
+    id: UUID,
+    data: SubmitApplicationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    with get_connection() as conn, conn.cursor() as cur:
+        # Проверяем, что кредитный продукт существует и активен
+        cur.execute(
+            """
+            SELECT id
+            FROM loan_products
+            WHERE id = %s AND is_active IS TRUE
+            """,
+            (data.selectedProductId,),
+        )
+
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Кредитный продукт не найден или неактивен",
+            )
+
+        # Отправляем заявку на рассмотрение
+        cur.execute(
+            """
+            UPDATE applications
+            SET selected_product_id = %s,
+                status = 'pending',
+                submitted_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+              AND user_id = %s
+              AND status = 'draft'
+            RETURNING
+                id,
+                status,
+                company_data,
+                selected_product_id,
+                original_terms,
+                active_terms,
+                submitted_at,
+                created_at,
+                updated_at
+            """,
+            (
+                data.selectedProductId,
+                id,
+                current_user["id"],
+            ),
+        )
+
+        row = cur.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Черновик не найден или уже отправлен",
+            )
+
+    return {
+        "id": str(row[0]),
+        "status": row[1],
+        "companyData": row[2],
+        "selectedProductId": str(row[3]),
+        "originalTerms": row[4],
+        "activeTerms": row[5],
+        "submittedAt": row[6].isoformat() if row[6] else None,
+        "createdAt": row[7].isoformat() if row[7] else None,
+        "updatedAt": row[8].isoformat() if row[8] else None,
+    }
+
+@app.get('/api/v1/applications/{id}/recommendations')
+def get_applications_recommendations(id: UUID, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    try:
+        return generate_recommendations(id, current_user["id"])
+    except RecommendationApplicationNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail="Заявка не найдена",
+        )
+    except RecommendationGenerationError:
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось сформировать рекомендации",
+        )
+
