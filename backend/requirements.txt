@@ -7,3 +7,5 @@ psycopg[binary]
 pwdlib
 PyJwt
 smolagents
+email-validator
+python-multipart

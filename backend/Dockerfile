@@ -1,12 +1,17 @@
 FROM python:3.12-slim
 
-LABEL authors="deconfinement_"
-
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH="/app:/app/backend/src"
 
-COPY src ./src/
+COPY requirements.txt /app/requirements.txt
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app/backend/
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "python -c 'from backend.src.db import init_db; init_db()' && uvicorn backend.src.main:app --host 0.0.0.0 --port 8000"]

@@ -1,32 +1,40 @@
 services:
-
   api:
-    build: ./src
-    expose:
-      - "8000"
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
+      DB_PORT: "5432"
       DB_NAME: app_db
       DB_USER: app_user
-      DB_PASSWORD: ${DB_PASSWORD}
+      DB_PASSWORD: ${DB_PASSWORD:-local_dev_password}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-dev-secret-change-me}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - documents_data:/app/backend/uploads/documents
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
 
   postgres:
     image: postgres:17
     environment:
       POSTGRES_DB: app_db
       POSTGRES_USER: app_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-local_dev_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app_user -d app_db"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  documents_data:
